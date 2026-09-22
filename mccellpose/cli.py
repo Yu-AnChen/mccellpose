@@ -60,72 +60,63 @@ def auto_threshold(img):
     return vmax
 
 
-def write_label_pyramid(level0, out_path, pixel_size, tile, predictor=True):
+def write_label_pyramid(x, out_path, pixel_size_um, tile, predictor=True):
     """Write a 2-D label array as a tiled, pyramidal OME-TIFF with pixel size metadata"""
-    x = level0 if isinstance(level0, dask.array.Array) else dask.array.from_zarr(level0)
     dtype = x.dtype
-    base_shape = tuple(x.shape)
+    base_shape = np.array(x.shape, int)
     # Number of factor-2 levels needed to bring the largest dimension down to a
     # single tile. Each coarser level's shape is the previous level's shape
     # halved and rounded up, matching the strided downsampling below.
     num_levels = max(int(np.ceil(np.log2(max(base_shape) / tile))) + 1, 1)
-    shapes = [tuple(-(-s // 2 ** i) for s in base_shape) for i in range(num_levels)]
+    factors = 2 ** np.arange(num_levels)
+    shapes = np.ceil(base_shape / factors[:, None]).astype(int)
 
     def base_tiles():
         h, w = base_shape
         for r in range(0, h, tile):
             for c in range(0, w, tile):
-                yield np.ascontiguousarray(x[r : r + tile, c : c + tile])
+                yield x[r : r + tile, c : c + tile]
 
     def subres_tiles(level):
         # Build this level by reading the previous level back from the output
         # file as it is being written. is_ome=False because the OME-XML is only
         # finalised on writer close.
         tiff = tifffile.TiffFile(out_path, is_ome=False)
-        try:
-            prev = zarr.open(tiff.series[0].aszarr(level=level - 1), mode="r")
-            h, w = prev.shape
-            step = tile * 2
-            for r in range(0, h, step):
-                for c in range(0, w, step):
-                    # Downsample by strided slicing rather than averaging so
-                    # label IDs are preserved.
-                    block = prev[r : r + step, c : c + step]
-                    yield np.ascontiguousarray(block[::2, ::2])
-        finally:
-            tiff.close()
+        prev = zarr.open(tiff.series[0].aszarr(level=level - 1), mode="r")
+        h, w = prev.shape
+        step = tile * 2
+        for r in range(0, h, step):
+            for c in range(0, w, step):
+                block = prev[r : r + step, c : c + step]
+                # Downsample by strided slicing rather than averaging so
+                # label IDs are preserved.
+                yield block[::2, ::2]
 
+    resolution = 1e4 / pixel_size_um
     opts = dict(
         tile=(tile, tile),
-        # zstd is both faster and ~20% smaller than zlib.
-        compression="zstd",
-        resolution=(1e4 / pixel_size, 1e4 / pixel_size),
+        compression="zlib",
+        predictor=predictor,
+        resolution=(resolution, resolution),
         resolutionunit="CENTIMETER",
-        # Leave maxworkers at tifffile's default rather than forcing 1. It
-        # compresses tiles across ~half the available cores -- CPU-affinity
-        # aware on Linux, None-safe, and overridable via TIFFFILE_NUM_THREADS.
-        # Pyramid writing is its own phase after segmentation, so the cores are
-        # otherwise idle, and ~half-cores already sits near the speedup knee.
     )
-    if predictor:
-        opts["predictor"] = True
-    with tifffile.TiffWriter(out_path, bigtiff=True, ome=True) as tif:
-        tif.write(
+    with tifffile.TiffWriter(out_path, bigtiff=True, ome=True) as tiff:
+        tiff.write(
             base_tiles(),
             shape=base_shape,
             dtype=dtype,
             subifds=num_levels - 1,
             metadata={
                 "axes": "YX",
-                "PhysicalSizeX": pixel_size,
+                "PhysicalSizeX": pixel_size_um,
                 "PhysicalSizeXUnit": "µm",
-                "PhysicalSizeY": pixel_size,
+                "PhysicalSizeY": pixel_size_um,
                 "PhysicalSizeYUnit": "µm",
             },
             **opts,
         )
         for level in range(1, num_levels):
-            tif.write(
+            tiff.write(
                 subres_tiles(level),
                 shape=shapes[level],
                 dtype=dtype,
@@ -479,15 +470,14 @@ def main():
             " that could not be segmented"
         )
 
-    # channel 0 = nucleus, 1 = cell in the labels_full zarr
-    outputs = [("cell", args.output_cell, 1)]
-    if args.output_nucleus:
-        outputs.append(("nucleus", args.output_nucleus, 0))
     labels_da = dask.array.from_zarr(labels_full)
-    for name, out_path, m in outputs:
+    outputs = [("cell", args.output_cell, labels_da[1])]
+    if args.output_nucleus:
+        outputs.append(("nucleus", args.output_nucleus, labels_da[0]))
+    for name, out_path, dimg in outputs:
         logger.info(f"Writing {name} masks to pyramidal OME-TIFF: {out_path}")
         write_label_pyramid(
-            labels_da[m],
+            dimg,
             out_path,
             pixel_size,
             tw,
