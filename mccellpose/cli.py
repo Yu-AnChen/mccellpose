@@ -1,8 +1,11 @@
 import argparse
 import concurrent.futures
 import itertools
+import json
 import pathlib
+import shutil
 import sys
+import tempfile
 import warnings
 
 import cellpose.models
@@ -26,16 +29,26 @@ from . import __version__
 software_version = f"mccellpose {__version__}"
 
 
-def segment_tile(timg, cp_model, contrast_limits, cytoplasm_thickness, diameter):
+def segment_tile(timg, cp_model, contrast_limits, cytoplasm_thickness, diameter,
+                 norm_blocksize):
+    """timg is (C, Y, X)."""
     if np.ptp(timg) == 0:
-        return np.zeros(timg.shape, dtype="int32"), np.zeros(timg.shape, dtype="int32")
+        return (np.zeros(timg.shape[1:], dtype="int32"),) * 2
 
-    timg = skimage.exposure.rescale_intensity(
-        timg, in_range=contrast_limits, out_range="float"
-    )
+    if norm_blocksize:
+        # cellpose's own per-block 1-99 percentile scaling. "normalize": True
+        # must be explicit: cellpose 4.2 can leave its shared default at False.
+        normalize = {"normalize": True, "tile_norm_blocksize": norm_blocksize}
+    else:
+        timg = np.stack([
+            skimage.exposure.rescale_intensity(c, in_range=lim, out_range="float")
+            for c, lim in zip(timg, contrast_limits)
+        ])
+        normalize = False
     labels_nucleus = cp_model.eval(
         timg,
-        normalize=False,
+        channel_axis=0,
+        normalize=normalize,
         diameter=diameter,
     )[0]
     labels_cell = skimage.segmentation.expand_labels(
@@ -133,6 +146,20 @@ def write_label_pyramid(x, out_path, pixel_size_um, tile, predictor=True):
             )
 
 
+def outline(prop, y, x, factor):
+    """Outer contour of a regionprops object in tile (y, x) at a pyramid level,
+    as [[x, y], ...] in level-0 pixel-corner coordinates (QuPath's convention)."""
+    r0, c0 = prop.bbox[:2]
+    ring = max(
+        skimage.measure.find_contours(np.pad(prop.image, 1).astype(float), 0.5),
+        key=len,
+    )
+    # find_contours runs through pixel centres: +0.5 to pixel corners, -1 for the pad.
+    xs = factor * (x + c0 + ring[:, 1] - 0.5)
+    ys = factor * (y + r0 + ring[:, 0] - 0.5)
+    return np.c_[xs, ys].round(2).tolist()
+
+
 def get_low_res(reader):
     """Return a low resolution pyramid level, at least 200x200 px for auto_threshold"""
 
@@ -215,8 +242,31 @@ def main():
     parser.add_argument(
         '-c', '--channel',
         type=int,
+        nargs='+',
         required=True,
-        help='DNA channel to segment (1-based)',
+        help='Channel(s) to segment (1-based), in the order the model expects',
+    )
+    parser.add_argument(
+        '--level',
+        type=int,
+        default=0,
+        help='Pyramid level to segment (default: 0, full resolution)',
+    )
+    parser.add_argument(
+        '--model',
+        help='Path to fine-tuned cellpose weights (default: stock cpsam)',
+    )
+    parser.add_argument(
+        '--norm-blocksize',
+        type=int,
+        help="Use cellpose's per-block percentile normalization with this block"
+        " size in pixels, instead of --contrast-limits / auto-detection",
+    )
+    parser.add_argument(
+        '--geojson',
+        type=pathlib.Path,
+        help='Also write the outlines as GeoJSON for QuPath: "Vessel" detections,'
+        ' level-0 coordinates',
     )
     parser.add_argument(
         '--tile-width',
@@ -232,8 +282,9 @@ def main():
     parser.add_argument(
         '--expand-size',
         type=float,
-        required=True,
-        help='Number of microns to expand nuclei masks to obtain cytoplasm masks',
+        default=0,
+        help='Number of microns to expand nuclei masks to obtain cytoplasm masks'
+        ' (default: 0, no expansion)',
     )
     parser.add_argument(
         '--diameter',
@@ -364,6 +415,17 @@ def main():
         pixel_size = ppsx.to("micron").m
         logger.info(f"Pixel size detected from OME-TIFF: {pixel_size} µm")
 
+    levels = tiff.series[0].levels
+    if not 0 <= args.level < len(levels):
+        logger.error(f"--level {args.level}: image has {len(levels)} levels")
+        sys.exit(1)
+    factor = round(levels[0].shape[-1] / levels[args.level].shape[-1])
+    if abs(levels[0].shape[-1] / factor - levels[args.level].shape[-1]) > 1:
+        logger.error(f"Level {args.level} is not an integer downsample of level 0")
+        sys.exit(1)
+    pixel_size *= factor
+    logger.info(f"Level {args.level}: {factor}x downsample, {pixel_size} µm/px")
+
     tw = args.tile_width
     if tw % 16 != 0:
         logger.error("--tile-width value must be a multiple of 16")
@@ -385,19 +447,37 @@ def main():
         logger.info(f"Requesting cellpose cell diameter rescaling to {diameter} px")
         cp_diameter = diameter
 
-    img = zarr.open(tiff.series[0][args.channel - 1].aszarr(level=0), mode="r")
+    img = zarr.open(tiff.series[0].aszarr(level=args.level), mode="r")
+    channels = [c - 1 for c in args.channel]
+    nchan = img.shape[0] if img.ndim == 3 else 1
+    if not all(0 <= c < nchan for c in channels):
+        logger.error(f"--channel {args.channel}: image has {nchan} channel(s)")
+        sys.exit(1)
+
+    def read(c, ys, xs):
+        return img[ys, xs] if img.ndim == 2 else img[c, ys, xs]
     expand_size_px = round(args.expand_size / pixel_size)
 
-    if args.contrast_limits:
-        contrast_limits = tuple(args.contrast_limits)
-        logger.info(f"Rescaling intensity to user-specified limits: {contrast_limits}")
+    contrast_limits = None
+    if args.norm_blocksize:
+        logger.info(f"Per-block normalization, block size {args.norm_blocksize} px")
+    elif args.contrast_limits:
+        contrast_limits = [tuple(args.contrast_limits)] * len(channels)
+        logger.info(f"Rescaling intensity to user-specified limits: {contrast_limits[0]}")
     else:
         logger.info("Computing image contrast...")
-        intensity_max = float(auto_threshold(dask.array.from_zarr(img)))
-        contrast_limits = (0, intensity_max)
+        contrast_limits = [
+            (0, float(auto_threshold(
+                dask.array.from_zarr(img) if img.ndim == 2 else dask.array.from_zarr(img)[c]
+            )))
+            for c in channels
+        ]
         logger.info(f"Rescaling intensity to auto-detected limits: {contrast_limits}")
 
-    cp_model = cellpose.models.CellposeModel(gpu=args.use_gpu)
+    cp_model = cellpose.models.CellposeModel(
+        gpu=args.use_gpu, **({"pretrained_model": args.model} if args.model else {})
+    )
+    height, width = img.shape[-2:]
 
     step = tw - overlap
     # Subtract 1 from image dimensions when computing the upper limit for the
@@ -408,30 +488,35 @@ def main():
     # fully covered by the overlap from the previous window anyway, so skipping
     # these windows doesn't affect our results.
     # FIXME: Omit edge windows up to the full overlap size too?
-    ys = np.arange(0, img.shape[0] - 1, step)
-    xs = np.arange(0, img.shape[1] - 1, step)
+    ys = np.arange(0, height - 1, step)
+    xs = np.arange(0, width - 1, step)
+    # Per-run temp dir next to the output, so concurrent runs don't collide.
+    temp_dir = pathlib.Path(tempfile.mkdtemp(prefix="mccellpose-", dir=args.output_cell.parent))
     labels_full = zarr.open(
-        'temp_labels.zarr',
+        temp_dir / 'temp_labels.zarr',
         mode='w',
-        shape=(2,) + img.shape,
+        shape=(2, height, width),
         chunks=(1, tw, tw),
         dtype=np.uint32,
     )
     mask_discard = zarr.open(
-        'temp_discard.zarr',
+        temp_dir / 'temp_discard.zarr',
         mode='w',
-        shape=img.shape,
+        shape=(height, width),
         chunks=(tw, tw),
         dtype=bool,
     )
     num_masks = 0
+    features = []
 
     def get_tile(arr, y, x):
         return arr[y : y + tw, x : x + tw]
 
     def work(y, x):
+        timg = np.stack([read(c, slice(y, y + tw), slice(x, x + tw)) for c in channels])
         return segment_tile(
-            get_tile(img, y, x), cp_model, contrast_limits, expand_size_px, cp_diameter
+            timg, cp_model, contrast_limits, expand_size_px, cp_diameter,
+            args.norm_blocksize,
         )
 
     coords = list(itertools.product(ys, xs))
@@ -476,6 +561,17 @@ def main():
             num_masks += 1
             lf_window[0][pn.slice][pn.image] = num_masks
             lf_window[1][pc.slice][pc.image] = num_masks
+            if args.geojson:
+                features.append({
+                    "type": "Feature",
+                    "geometry": {"type": "Polygon", "coordinates": [outline(pc, y, x, factor)]},
+                    # A bare string: QuPath's parser rejects {"name": ...} without "color".
+                    "properties": {
+                        "objectType": "detection",
+                        "classification": "Vessel",
+                        "measurements": {"label": num_masks},
+                    },
+                })
             # Clear discard mask for this cell since we've seen it now.
             md_window[pc.slice][pc.image] = False
         # Write working copies back to the zarr arrays.
@@ -527,6 +623,11 @@ def main():
             predictor=False,
         )
 
+    if args.geojson:
+        logger.info(f"Writing {len(features)} outlines to GeoJSON: {args.geojson}")
+        args.geojson.write_text(json.dumps({"type": "FeatureCollection", "features": features}))
+
+    shutil.rmtree(temp_dir)
     logger.info('')
     logger.info('Run complete')
 
