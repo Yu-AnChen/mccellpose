@@ -300,8 +300,15 @@ def main():
     parser.add_argument(
         '--geojson',
         type=pathlib.Path,
-        help='Also write the outlines as GeoJSON for QuPath: "Vessel" detections,'
+        help='Also write the outlines as GeoJSON for QuPath: "Vessel" objects,'
         ' level-0 coordinates',
+    )
+    parser.add_argument(
+        '--geojson-object-type',
+        choices=['detection', 'annotation'],
+        default='detection',
+        help='QuPath object type in the GeoJSON (default: detection, lighter for'
+        ' whole slides; annotation to edit them)',
     )
     parser.add_argument(
         '--tile-width',
@@ -602,7 +609,7 @@ def main():
                     "geometry": {"type": "Polygon", "coordinates": [outline(pc, y, x, factor)]},
                     # A bare string: QuPath's parser rejects {"name": ...} without "color".
                     "properties": {
-                        "objectType": "detection",
+                        "objectType": args.geojson_object_type,
                         "classification": "Vessel",
                         "measurements": {"label": num_masks},
                     },

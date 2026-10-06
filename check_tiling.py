@@ -75,7 +75,8 @@ def main():
         sys.argv = ["mccellpose", "-i", str(d / "in.ome.tif"), "-o", str(d / "out.ome.tif"),
                     "--channel", "2", "1", "--level", "1", "--model", MODEL,
                     "--norm-blocksize", str(BLOCK), "--tile-width", "512",
-                    "--tile-overlap", "160", "--two-scale", "--geojson", str(d / "out.geojson")]
+                    "--tile-overlap", "160", "--two-scale", "--geojson", str(d / "out.geojson"),
+                    "--geojson-object-type", "annotation"]
         cli.main()
 
         got = tifffile.imread(d / "out.ome.tif")
@@ -93,6 +94,7 @@ def main():
     for p in keep:
         ids = np.unique(got[p.slice][p.image])
         assert len(ids) == 1 and ids[0] > 0 and (got == ids[0]).sum() == p.area, p.label
+    assert {f["properties"]["objectType"] for f in geo} == {"annotation"}
     by_label = {f["properties"]["measurements"]["label"]: f for f in geo}
     for p in skimage.measure.regionprops(got):
         xy = np.array(by_label[p.label]["geometry"]["coordinates"][0]) / FACTOR
