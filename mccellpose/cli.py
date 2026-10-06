@@ -245,7 +245,9 @@ class TqdmLogWrapper:
             self.logger.info(s[1:])
 
 
-def main():
+def main(argv=None, segment=None):
+    """segment: optional callable (C, Y, X) tile -> int labels, used instead of
+    cellpose (and its intensity scaling); tiling and stitching are unchanged."""
 
     parser = argparse.ArgumentParser(
         description="Run cellpose on an OME-TIFF using overlapping tiles for"
@@ -378,7 +380,7 @@ def main():
         ' parallelized and will automatically use all available CPUs.',
     )
     parser.add_argument('--version', action='version', version=software_version)
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     if sys.stdout.isatty():
         # Simplified output for casual interactive use.
@@ -501,7 +503,9 @@ def main():
     expand_size_px = round(args.expand_size / pixel_size)
 
     contrast_limits = None
-    if args.norm_blocksize:
+    if segment:
+        logger.info("Custom segmenter: --model, --norm-blocksize and contrast options unused")
+    elif args.norm_blocksize:
         logger.info(f"Per-block normalization, block size {args.norm_blocksize} px")
     elif args.contrast_limits:
         contrast_limits = [tuple(args.contrast_limits)] * len(channels)
@@ -516,7 +520,7 @@ def main():
         ]
         logger.info(f"Rescaling intensity to auto-detected limits: {contrast_limits}")
 
-    cp_model = cellpose.models.CellposeModel(
+    cp_model = None if segment else cellpose.models.CellposeModel(
         gpu=args.use_gpu, **({"pretrained_model": args.model} if args.model else {})
     )
     height, width = img.shape[-2:]
@@ -556,6 +560,9 @@ def main():
 
     def work(y, x):
         timg = np.stack([read(c, slice(y, y + tw), slice(x, x + tw)) for c in channels])
+        if segment:
+            labels = segment(timg).astype("int32")
+            return labels, skimage.segmentation.expand_labels(labels, expand_size_px)
         return segment_tile(
             timg, cp_model, contrast_limits, expand_size_px, cp_diameter,
             args.norm_blocksize, pixel_size if args.two_scale else None,
