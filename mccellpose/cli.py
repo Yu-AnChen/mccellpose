@@ -29,9 +29,33 @@ from . import __version__
 software_version = f"mccellpose {__version__}"
 
 
+# Two-scale merge (vessel fork; validated on held-out regions with these values).
+CUT_UM = 50         # coarse objects at least this wide (equivalent diameter) win
+INSIDE = 0.5        # fine objects at least this fraction inside a winner are replaced
+COARSE_DIAMETER = 60  # cellpose rescale 30/60 = 0.5: network at half resolution
+
+
+def merge_scales(fine, coarse, um_per_px):
+    """Instance labels at one resolution -> merged labels, 1..n (int32). Every
+    coarse object >= CUT_UM across replaces the fine objects lying >= INSIDE
+    inside it, and wins where they overlap."""
+    min_area = np.pi * (CUT_UM / 2 / um_per_px) ** 2
+    area = np.bincount(coarse.ravel())
+    big = np.flatnonzero(area >= min_area)
+    big = big[big > 0]
+    in_big = np.isin(coarse, big)
+    frac = np.bincount(fine.ravel(), weights=in_big.ravel()) / np.maximum(np.bincount(fine.ravel()), 1)
+    drop = np.flatnonzero(frac >= INSIDE)
+    out = np.where(np.isin(fine, drop[drop > 0]), 0, fine.astype(np.int64))
+    out[in_big] = coarse[in_big].astype(np.int64) + fine.max() + 1
+    ids, out = np.unique(out, return_inverse=True)          # sequential, 0 stays 0
+    return (out.reshape(fine.shape) + (0 if ids[0] == 0 else 1)).astype(np.int32)
+
+
 def segment_tile(timg, cp_model, contrast_limits, cytoplasm_thickness, diameter,
-                 norm_blocksize):
-    """timg is (C, Y, X)."""
+                 norm_blocksize, two_scale_um=None):
+    """timg is (C, Y, X). two_scale_um: pixel size, to also run the network at half
+    resolution (flows followed at full resolution) and merge_scales the two."""
     if np.ptp(timg) == 0:
         return (np.zeros(timg.shape[1:], dtype="int32"),) * 2
 
@@ -51,6 +75,11 @@ def segment_tile(timg, cp_model, contrast_limits, cytoplasm_thickness, diameter,
         normalize=normalize,
         diameter=diameter,
     )[0]
+    if two_scale_um:
+        coarse = cp_model.eval(
+            timg, channel_axis=0, normalize=normalize, diameter=COARSE_DIAMETER
+        )[0]
+        labels_nucleus = merge_scales(labels_nucleus, coarse, two_scale_um)
     labels_cell = skimage.segmentation.expand_labels(
         labels_nucleus, cytoplasm_thickness
     )
@@ -261,6 +290,12 @@ def main():
         type=int,
         help="Use cellpose's per-block percentile normalization with this block"
         " size in pixels, instead of --contrast-limits / auto-detection",
+    )
+    parser.add_argument(
+        '--two-scale',
+        action='store_true',
+        help=f'Also run the network at half resolution; objects >= {CUT_UM} um from'
+        ' it replace the full-resolution objects inside them (large lumens)',
     )
     parser.add_argument(
         '--geojson',
@@ -516,7 +551,7 @@ def main():
         timg = np.stack([read(c, slice(y, y + tw), slice(x, x + tw)) for c in channels])
         return segment_tile(
             timg, cp_model, contrast_limits, expand_size_px, cp_diameter,
-            args.norm_blocksize,
+            args.norm_blocksize, pixel_size if args.two_scale else None,
         )
 
     coords = list(itertools.product(ys, xs))
